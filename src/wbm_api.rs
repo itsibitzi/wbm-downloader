@@ -1,4 +1,5 @@
 use async_recursion::async_recursion;
+use reqwest::Response;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::{sleep, Duration};
@@ -34,7 +35,7 @@ pub async fn get_calendar_captures(
         url, year_month_string
     );
 
-    let captures = reqwest::get(&api_url)
+    let captures = fetch_with_retries(&api_url, 3)
         .await?
         .json::<RawCalendarCapture>()
         .await?;
@@ -73,9 +74,9 @@ pub async fn get_calendar_captures(
 }
 
 #[async_recursion]
-async fn fetch_with_retries(page_url: &str, retries: i32) -> anyhow::Result<String> {
+async fn fetch_with_retries(page_url: &str, retries: i32) -> anyhow::Result<Response> {
     match reqwest::get(page_url).await {
-        Ok(resp) => Ok(resp.text().await?),
+        Ok(resp) => Ok(resp),
         Err(_) if retries > 0 => {
             sleep(Duration::from_secs_f32((1.0 / retries as f32) * 5.0)).await;
             fetch_with_retries(page_url, retries - 1).await
@@ -94,5 +95,5 @@ pub async fn get_capture(
         url
     );
 
-    fetch_with_retries(&page_url, 3).await
+    Ok(fetch_with_retries(&page_url, 3).await?.text().await?)
 }
