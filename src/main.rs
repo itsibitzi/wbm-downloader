@@ -1,36 +1,19 @@
 use clap::Parser;
+use cli::Cli;
 use futures::{stream, StreamExt};
-use serde_json::Value;
 
 use wbm_api::get_calendar_captures;
-use wbm_date::{get_months_between_dates, to_wbm_date, RangePart};
+use wbm_chrono::{PartialDateRoundingMode, YearMonthDay, YearMonthDayHourMinuteSecond};
 
 use output_directory::OutputDirectory;
 
 use crate::wbm_api::get_capture;
 
+mod cli;
 mod error;
 mod output_directory;
 mod wbm_api;
-mod wbm_date;
-
-#[derive(Debug, Parser)]
-#[clap(author, version, about, long_about = None)]
-#[clap(propagate_version = true)]
-struct Cli {
-    /// The URL prefix to query WBM
-    url: String,
-    /// Match captures after this date
-    from_date: String,
-    /// Match captures before this date
-    until_date: String,
-    /// Set the output directory for the captures
-    #[clap(short, long, default_value = "./")]
-    output_directory: String,
-    /// Verbose output logs if files are already downloaded
-    #[clap(short, long)]
-    verbose: bool,
-}
+mod wbm_chrono;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -38,46 +21,42 @@ async fn main() -> anyhow::Result<()> {
 
     let output_dir = OutputDirectory::new(&cli.url, cli.output_directory)?;
 
-    let wbm_from = to_wbm_date(RangePart::From, cli.from_date)?;
-    let wbm_until = to_wbm_date(RangePart::Until, cli.until_date)?;
+    let from = YearMonthDay::from_str(&cli.from_date, PartialDateRoundingMode::Floor)?;
+    let until = YearMonthDay::from_str(&cli.until_date, PartialDateRoundingMode::Ceiling)?;
 
-    let mut all_capture_ymdhms: Vec<String> = vec![];
+    // WBM API lets you search on a prefix time. We'll go with months cos they usually
+    // have a good number of captures (not too many, not too few)
+    let months_to_check = from
+        .to_year_month()
+        .months_between_inclusive(&until.to_year_month())?;
 
-    let mut months_to_check: Vec<String> = get_months_between_dates(&wbm_from, &wbm_until)
-        .into_iter()
-        .collect();
-    months_to_check.sort();
+    eprintln!("Fetching captures for {} months", months_to_check.len());
 
-    println!("Fetching captures for {} months", months_to_check.len());
+    let mut all_capture_ymdhms: Vec<YearMonthDayHourMinuteSecond> = vec![];
+
+    // We only allow to the day precision on the inputs, but we check a whole month
+    // for captures so we have to manually filter out captures before the day we request
+    let from_min_filter_ymdhs =
+        from.to_year_month_day_hour_minute_second(PartialDateRoundingMode::Floor);
+    let until_max_filter_ymdhs =
+        until.to_year_month_day_hour_minute_second(PartialDateRoundingMode::Ceiling);
 
     for year_month in months_to_check {
-        println!("Fetching captures for {}", year_month);
+        eprintln!("Fetching captures for {}", year_month);
 
-        let captures = get_calendar_captures(&cli.url, &year_month)
-            .await
-            .expect("Failed to get captures");
+        let captures = get_calendar_captures(&cli.url, &year_month).await?;
 
         captures
             .items
             .unwrap_or_default()
-            .iter()
-            .filter(|capture_row| {
-                matches!(capture_row, [_, Value::Number(num), _] if num.as_i64().unwrap() == 200)
-            })
-            .map(|ok_row| {
-                let dhms = ok_row[0].to_string();
-
-                // The WBM returns integers so leading zeros are cut off
-                if dhms.len() == 7 {
-                    format!("{}0{}", &year_month, dhms)
-                } else {
-                    format!("{}{}", &year_month, dhms)
-                }
-            })
+            .into_iter()
+            .filter(|item| item.status == 200)
+            .map(|ok_row| ok_row.ymdhms)
+            .filter(|ymdhms| *ymdhms > from_min_filter_ymdhs && *ymdhms < until_max_filter_ymdhs)
             .for_each(|capture_ymdhms| all_capture_ymdhms.push(capture_ymdhms));
     }
 
-    println!("Gathered {} captures", all_capture_ymdhms.len());
+    eprintln!("Gathered {} captures", all_capture_ymdhms.len());
 
     stream::iter(all_capture_ymdhms)
         .map(|ymdhms| {
@@ -86,24 +65,25 @@ async fn main() -> anyhow::Result<()> {
 
             async move {
                 if !output_dir.check_if_capture_exists(&ymdhms) {
-                    println!("Downloading {}", ymdhms);
-                    let html = get_capture(&ymdhms, url).await?;
-                    output_dir.save_html(&ymdhms, &html)
-                } else {
-                    if cli.verbose {
-                        println!("Already got {}", ymdhms);
+                    eprintln!("Downloading {}", ymdhms.as_wbm_datetime_str());
+
+                    match get_capture(&ymdhms, url).await {
+                        Ok(html) => {
+                            if let Err(e) = output_dir.save_html(&ymdhms, &html) {
+                                eprintln!("Failed to save capture: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to get capture: {}", e);
+                        }
                     }
-                    Ok(())
+                } else {
+                    eprintln!("Already got {}", ymdhms.as_wbm_datetime_str());
                 }
             }
         })
         .buffer_unordered(16)
-        .for_each(|r| async {
-            match r {
-                Err(e) => eprintln!("Failed to save capture: {}", e),
-                _ => {}
-            }
-        })
+        .collect::<()>()
         .await;
 
     Ok(())
